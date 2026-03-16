@@ -25,6 +25,7 @@ Packaged as a single Docker image with a lightweight FastAPI server. Supports ze
 - [Running the Container](#running-the-container)
 - [API Reference](#api-reference)
 - [Auto-chunking TTS](#post-v1ttsauto)
+- [Streaming mode](#streaming-mode)
 - [Voice Cloning](#voice-cloning)
 - [Emotion and Tone Markers](#emotion-and-tone-markers)
 - [Performance](#performance)
@@ -40,6 +41,7 @@ Packaged as a single Docker image with a lightweight FastAPI server. Supports ze
 - Automatic model download when `HF_TOKEN` is provided
 - Docker-native with volume-based model persistence
 - Automatic chunking for long texts (`/v1/tts/auto` — split + concatenate)
+- Optional streaming mode on `/v1/tts/auto` for lower first-byte latency
 - **Coming soon:** S2-pro model support
 
 ## Requirements
@@ -383,6 +385,7 @@ Long-text TTS with automatic chunking. Splits the input text into sentences, gen
 | `temperature` | float | `0.7` | Sampling temperature (0.1-1.0) |
 | `seed` | int | `null` | Random seed for reproducibility |
 | `normalize` | bool | `true` | Normalize text |
+| `streaming` | bool | `false` | Stream audio chunks as they are generated (see [Streaming mode](#streaming-mode)) |
 | `use_memory_cache` | string | `"off"` | Memory cache (`on`, `off`) |
 
 The text is split at sentence boundaries (`.`, `!`, `?`), then at commas, then at spaces if chunks are still too long. Voice cloning references are applied to every chunk for consistent voice.
@@ -412,6 +415,54 @@ with open("long_output.wav", "wb") as f:
 ```
 
 **Performance (RTX 2060 6GB):** ~5 tokens/sec, ~25-30s per chunk. A 6-chunk text (~850 bytes) takes ~3 minutes total.
+
+### Streaming mode
+
+By default, `/v1/tts/auto` waits for all chunks to be generated and returns a single concatenated WAV file. With `streaming: true`, audio segments are sent to the client as soon as they are decoded, reducing the time to first audio byte.
+
+**How it works:** The response is a chunked HTTP stream (`Transfer-Encoding: chunked`). The first bytes are a WAV header, followed by raw int16 PCM segments as they come out of the decoder. Each text chunk (sentence) is processed with the engine's native streaming, so you receive audio segments within a chunk too — not just one blob per sentence.
+
+**Important: `streaming` defaults to `false` for a reason.** Streaming only works smoothly if the GPU generates audio faster than real-time. If the next segment takes longer to generate than the previous one takes to play, the client will experience gaps/silence between chunks. This depends entirely on your hardware:
+
+| GPU | Real-time factor | Streaming viable? |
+|---|---|---|
+| RTX 4090 / A100 | ~0.2-0.3x | Yes |
+| RTX 3090 | ~0.3-0.5x | Yes |
+| RTX 3070 / 3080 | ~0.5-0.8x | Borderline |
+| RTX 2060 / 3060 | ~0.8-1.5x | No — use default mode |
+| CPU | >>1x | No |
+
+If you're unsure, keep the default (`streaming: false`). You'll wait longer for the first byte, but the resulting audio is guaranteed to be continuous with no gaps.
+
+**Example — streaming with Python:**
+
+```python
+import requests
+
+response = requests.post("http://localhost:8080/v1/tts/auto", json={
+    "text": "A long text that will be split into chunks automatically.",
+    "streaming": True,
+}, stream=True)
+
+# Write chunks to file as they arrive
+with open("output.wav", "wb") as f:
+    for chunk in response.iter_content(chunk_size=4096):
+        f.write(chunk)
+```
+
+**Example — streaming to an audio player (low-latency pipeline):**
+
+```python
+import requests
+
+response = requests.post("http://localhost:8080/v1/tts/auto", json={
+    "text": "First sentence arrives fast. Then the rest follows chunk by chunk.",
+    "streaming": True,
+}, stream=True)
+
+for chunk in response.iter_content(chunk_size=4096):
+    audio_player.feed(chunk)  # play immediately as chunks arrive
+```
 
 ## Voice Cloning
 

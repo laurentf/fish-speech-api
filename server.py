@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 from typing import Literal
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import Response, RedirectResponse
+from fastapi.responses import Response, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -320,10 +320,48 @@ class TTSLongRequest(BaseModel):
     repetition_penalty: float = Field(default=1.2, ge=0.9, le=2.0)
     temperature: float = Field(default=0.7, ge=0.1, le=1.0)
 
+    # Streaming
+    streaming: bool = Field(default=False, description="Stream audio chunks as they are generated instead of waiting for full concatenation")
+
     # Other options
     seed: int | None = None
     normalize: bool = True
     use_memory_cache: Literal["on", "off"] = "off"
+
+
+def _stream_chunks(chunks: list[str], serve_references: list, params: dict):
+    """
+    Generator that streams audio chunk by chunk.
+    Yields WAV header first, then raw int16 PCM segments for each text chunk.
+    """
+    header_sent = False
+
+    for i, chunk_text in enumerate(chunks):
+        logger.info(f"Streaming chunk {i + 1}/{len(chunks)}: {chunk_text[:50]}...")
+
+        tts_request = ServeTTSRequest(
+            text=chunk_text,
+            references=serve_references,
+            streaming=True,
+            **params,
+        )
+
+        for result in engine.inference(tts_request):
+            if result.code == "error":
+                logger.error(f"Streaming TTS error on chunk {i + 1}: {result.error}")
+                return
+            elif result.code == "header" and not header_sent:
+                _, header_bytes = result.audio
+                if isinstance(header_bytes, np.ndarray):
+                    yield header_bytes.tobytes()
+                else:
+                    yield bytes(header_bytes)
+                header_sent = True
+            elif result.code == "segment":
+                _, segment = result.audio
+                if len(segment.shape) > 1:
+                    segment = segment.flatten()
+                yield (segment * 32767).astype(np.int16).tobytes()
 
 
 @app.post("/v1/tts/auto", responses={200: {"content": {"audio/wav": {}}}})
@@ -334,6 +372,8 @@ async def tts_auto(request: TTSLongRequest):
     Handles any text length — splits into sentences/segments when needed,
     generates audio for each chunk, and concatenates into a single WAV.
     Works fine with short texts too (single chunk). Use this by default.
+
+    Set streaming=true to receive audio chunks as they are generated (lower latency).
     """
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine not ready")
@@ -372,7 +412,18 @@ async def tts_auto(request: TTSLongRequest):
             use_memory_cache=request.use_memory_cache,
         )
 
-        # Generate audio for each chunk and concatenate
+        # Streaming mode: return audio chunks as they're generated
+        if request.streaming:
+            return StreamingResponse(
+                _stream_chunks(chunks, serve_references, params),
+                media_type="audio/wav",
+                headers={
+                    "Transfer-Encoding": "chunked",
+                    "X-Stream-Format": "wav-chunked",
+                },
+            )
+
+        # Non-streaming mode: generate all chunks and concatenate
         all_audio = []
         sample_rate = None
 
